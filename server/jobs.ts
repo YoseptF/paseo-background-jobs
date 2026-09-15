@@ -171,6 +171,14 @@ export interface JobRoot {
  * that job rather than a job of its own.
  */
 export function findJobRoots(table: Map<number, ProcessEntry>, daemonPid: number): JobRoot[] {
+  // Providers are recognised by being the daemon's own children. If the daemon pid is
+  // wrong the whole classification inverts silently — providers become jobs and real
+  // jobs disappear — so refuse to guess rather than report nonsense.
+  if (!table.has(daemonPid)) {
+    throw new Error(
+      `Paseo daemon process ${daemonPid} is not running; cannot tell provider processes from the jobs they started.`,
+    );
+  }
   const providers = new Map<string, ProcessEntry>();
   for (const entry of table.values()) {
     if (entry.agentId && entry.stat.ppid === daemonPid) providers.set(entry.agentId, entry);

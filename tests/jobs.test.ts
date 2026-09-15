@@ -15,7 +15,7 @@ interface Spec {
 }
 
 function table(...specs: Spec[]): Map<number, ProcessEntry> {
-  const entries = specs.map((spec): [number, ProcessEntry] => [
+  const entries = [{ pid: DAEMON, ppid: 1 }, ...specs].map((spec): [number, ProcessEntry] => [
     spec.pid,
     {
       stat: { pid: spec.pid, ppid: spec.ppid, pgid: spec.pid, state: "S", cpuSeconds: 0 },
@@ -102,6 +102,13 @@ describe("findJobRoots", () => {
     const [root] = findJobRoots(map, DAEMON);
     expect(root?.entry.stat.pid).toBe(300);
     expect(root?.provider).toBeNull();
+  });
+});
+
+describe("daemon identification", () => {
+  it("refuses to classify when the daemon pid is not a live process", () => {
+    const map = table({ pid: 200, ppid: DAEMON, agentId: "a" });
+    expect(() => findJobRoots(map, 999_999)).toThrow(/not running/);
   });
 });
 
