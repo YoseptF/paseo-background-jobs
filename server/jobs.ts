@@ -52,23 +52,44 @@ export interface ShellProcess extends ProcStat {
   startedAt: Date;
 }
 
-async function listOwnPids(): Promise<number[]> {
+interface ProcessEntry {
+  stat: ProcStat;
+  /** Where stdout points, when it is readable. */
+  stdout: string | null;
+}
+
+/**
+ * One pass over /proc per refresh. The pill polls continuously, so walking the
+ * table three times (shells, parents, descendants) was three times the syscalls
+ * for the same snapshot.
+ */
+async function readProcessTable(): Promise<Map<number, ProcessEntry>> {
   const uid = process.getuid?.();
-  const entries = await readdir("/proc", { withFileTypes: true });
-  const pids: number[] = [];
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry.name)) continue;
-    if (uid !== undefined) {
-      try {
-        const info = await stat(`/proc/${entry.name}`);
-        if (info.uid !== uid) continue;
-      } catch {
-        continue;
-      }
-    }
-    pids.push(Number(entry.name));
+  let names: string[];
+  try {
+    names = await readdir("/proc");
+  } catch {
+    return new Map();
   }
-  return pids;
+  const table = new Map<number, ProcessEntry>();
+  await Promise.all(
+    names.map(async (name) => {
+      if (!/^\d+$/.test(name)) return;
+      const pid = Number(name);
+      let raw: string;
+      try {
+        if (uid !== undefined && (await stat(`/proc/${name}`)).uid !== uid) return;
+        raw = await readFile(`/proc/${name}/stat`, "utf8");
+      } catch {
+        return;
+      }
+      const procStat = parseProcStat(pid, raw);
+      if (!procStat) return;
+      const stdout = await readlink(`/proc/${name}/fd/1`).catch(() => null);
+      table.set(pid, { stat: procStat, stdout });
+    }),
+  );
+  return table;
 }
 
 /** `pid (comm) state ppid pgrp ...` — comm can contain spaces and parentheses, so split on the last `)`. */
@@ -83,14 +104,6 @@ export function parseProcStat(pid: number, raw: string): ProcStat | null {
   const stime = Number(fields[12]);
   if (!state || Number.isNaN(ppid) || Number.isNaN(pgid)) return null;
   return { pid, ppid, pgid, state, cpuSeconds: (utime + stime) / CLOCK_TICKS_PER_SECOND };
-}
-
-async function readProcStat(pid: number): Promise<ProcStat | null> {
-  try {
-    return parseProcStat(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
-  } catch {
-    return null;
-  }
 }
 
 /** Strip the provider's shell-snapshot preamble back down to the command the agent wrote. */
@@ -111,23 +124,18 @@ async function readCommand(pid: number): Promise<string> {
 }
 
 /** Every live process whose stdout is an agent shell's output file, children included. */
-export async function scanShellProcesses(): Promise<ShellProcess[]> {
-  const pids = await listOwnPids();
+export async function scanShellProcesses(
+  table?: Map<number, ProcessEntry>,
+): Promise<ShellProcess[]> {
+  const processes = table ?? (await readProcessTable());
   const shells: ShellProcess[] = [];
   await Promise.all(
-    pids.map(async (pid) => {
-      let outputPath: string;
-      try {
-        outputPath = await readlink(`/proc/${pid}/fd/1`);
-      } catch {
-        return;
-      }
-      const match = OUTPUT_PATH.exec(outputPath);
+    [...processes].map(async ([pid, entry]) => {
+      if (!entry.stdout) return;
+      const match = OUTPUT_PATH.exec(entry.stdout);
       const sessionId = match?.groups?.["session"];
       const shellId = match?.groups?.["shell"];
       if (!sessionId || !shellId) return;
-      const procStat = await readProcStat(pid);
-      if (!procStat) return;
       const [command, cwd, startedAt] = await Promise.all([
         readCommand(pid),
         readlink(`/proc/${pid}/cwd`).catch(() => ""),
@@ -135,24 +143,31 @@ export async function scanShellProcesses(): Promise<ShellProcess[]> {
           .then((info) => info.ctime)
           .catch(() => new Date()),
       ]);
-      shells.push({ ...procStat, shellId, sessionId, outputPath, command, cwd, startedAt });
+      shells.push({
+        ...entry.stat,
+        shellId,
+        sessionId,
+        outputPath: entry.stdout,
+        command,
+        cwd,
+        startedAt,
+      });
     }),
   );
   return shells;
 }
 
 /** Transitive child count per root, so a job reads as more than the one shell being signalled. */
-async function countDescendants(roots: readonly number[]): Promise<Map<number, number>> {
+function countDescendants(
+  table: Map<number, ProcessEntry>,
+  roots: readonly number[],
+): Map<number, number> {
   const children = new Map<number, number[]>();
-  await Promise.all(
-    (await listOwnPids()).map(async (pid) => {
-      const procStat = await readProcStat(pid);
-      if (!procStat) return;
-      const siblings = children.get(procStat.ppid);
-      if (siblings) siblings.push(pid);
-      else children.set(procStat.ppid, [pid]);
-    }),
-  );
+  for (const { stat: procStat } of table.values()) {
+    const siblings = children.get(procStat.ppid);
+    if (siblings) siblings.push(procStat.pid);
+    else children.set(procStat.ppid, [procStat.pid]);
+  }
   const counts = new Map<number, number>();
   for (const root of roots) {
     let total = 0;
@@ -269,9 +284,11 @@ async function mapSessionsToAgents(
  * One entry per backgrounded shell. Children inherit the output file on fd 1, so
  * collapse each shell id onto its process-group leader.
  */
-export async function collectJobShells(): Promise<ShellProcess[]> {
+export async function collectJobShells(
+  table?: Map<number, ProcessEntry>,
+): Promise<ShellProcess[]> {
   const byShell = new Map<string, ShellProcess>();
-  for (const shell of await scanShellProcesses()) {
+  for (const shell of await scanShellProcesses(table)) {
     const key = `${shell.sessionId}:${shell.shellId}`;
     const current = byShell.get(key);
     const isLeader = shell.pid === shell.pgid;
@@ -291,8 +308,12 @@ export async function listBackgroundJobs(
   { agentId }: RpcInput<typeof listBackgroundJobsRpc>,
   { paseo }: PluginHandlerContext,
 ) {
-  const [shells, agentsBySession] = await Promise.all([collectJobShells(), mapSessionsToAgents(paseo)]);
-  const descendants = await countDescendants(shells.map((shell) => shell.pid));
+  const table = await readProcessTable();
+  const [shells, agentsBySession] = await Promise.all([
+    collectJobShells(table),
+    mapSessionsToAgents(paseo),
+  ]);
+  const descendants = countDescendants(table, shells.map((shell) => shell.pid));
   const now = Date.now();
 
   const jobs: BackgroundJob[] = [];
