@@ -1,11 +1,14 @@
 # Background Jobs
 
-A [Paseo](https://paseo.sh) plugin that surfaces the shells your Claude Code agents
-backgrounded — including the ones still running after the agent went idle.
+A [Paseo](https://paseo.sh) plugin that shows what your agents left running — the
+dev server, the `tail -f`, the stuck `until` loop — and lets you stop it.
 
-Paseo shows an agent as idle once its turn ends. If that turn left a `sleep`-loop, a dev
-server, a `tail -f`, or a stuck `until` guard running in the background, nothing in the UI
-says so. This plugin lists those processes, shows their live output, and lets you stop them.
+Paseo marks an agent idle as soon as its turn ends. If that turn started something that
+outlives the turn, nothing in the UI says so: the sidebar shows a stopped agent while the
+process keeps running. This plugin lists those processes, attributes each one to the agent
+that started it, tails their output, and stops them.
+
+Works with **any provider** — Claude Code, Codex, Gemini, and anything else Paseo can launch.
 
 ## Install
 
@@ -23,42 +26,62 @@ Then reload the app. The plugin adds:
 | `/jobs` slash command | opens the panel for the current agent |
 | Command Center: *Show background jobs* | opens the sidebar surface |
 
-Each job shows how long it has run, its PID, process state, CPU time, child count, and how
-much output it has produced. **Stop** sends `SIGTERM` to the job's process group; long-press
-(or hold) sends `SIGKILL`. A job whose agent is idle, closed, or gone is highlighted as
-outliving its agent.
+Each job shows elapsed time, PID, process state, CPU time, child count, output size, and
+the agent that started it. **Stop** sends `SIGTERM` to the job's process group; long-press
+sends `SIGKILL`.
+
+Jobs are labelled by how sure we are that nothing is waiting on them:
+
+| Label | Meaning |
+| --- | --- |
+| `background` | the provider said it backgrounded this, it outlived the turn that started it, or its agent is no longer running |
+| `detached` | the process escaped the agent's process tree entirely |
+| `active` | the agent is mid-turn and may still be waiting on this one |
+
+`active` jobs are hidden by default and excluded from the pill count, so the count does not
+flicker once per command while an agent works. Toggle **in-turn** to see them.
 
 ## How it works
 
-Claude Code points a Bash tool's stdout at
-`$TMPDIR/claude-<uid>/<project>/<sessionId>/tasks/<shellId>.output`. The daemon-side handler
-walks `/proc`, finds every process of yours whose `fd/1` resolves into that path, and reads
-the session and shell id straight out of it.
+Paseo exports `PASEO_AGENT_ID` into every provider process it launches, and the environment
+is inherited by everything that process spawns. So the plugin walks `/proc` once, reads that
+variable, and knows exactly which agent every process on the machine belongs to — without
+knowing anything about the provider that started it.
 
-That alone is not enough: a *foreground* shell the agent is still blocked on is
-indistinguishable from a backgrounded one in procfs — same own process group and session,
-`/dev/null` on stdin, same output file. So the handler also reads the session transcript
-under `~/.claude/projects/` (or `$CLAUDE_CONFIG_DIR`) and keeps only shells the provider
-announced as `running in background with ID: <shellId>`. Transcripts are read incrementally
-from the last byte offset, so polling stays cheap on multi-megabyte sessions.
+A *job* is then the topmost agent-owned process of a piece of work: one whose parent is the
+provider itself, or one that has been reparented away from it. Anything deeper is part of
+that job rather than a job of its own. The provider process, and the session plumbing it
+starts in its first seconds (MCP servers and friends), are excluded.
 
-Sessions are matched back to Paseo agents through the `runtimeInfo.sessionId` the daemon
-already tracks, so each job is attributed to the agent that started it.
+Because attribution is by inherited environment rather than by process tree, a job is still
+attributed correctly after it detaches — a `setsid`/`nohup` process reparented to init is
+found and labelled `detached`, which is usually the one you most wanted to know about.
 
-`Stop` re-resolves the PID to a live job and checks the shell id still matches before
-signalling, so a recycled PID can never be hit by a stale row.
+On top of that generic base, two extra signals sharpen the `background` label:
+
+- Paseo's `agent.turn_ended` hook: anything still alive when a turn finishes is by
+  definition not being waited on, and stays marked for the rest of its life. This works for
+  every provider.
+- Claude Code names each Bash shell and announces the ones it backgrounds in the session
+  transcript, which is read incrementally from the last byte offset. When that signal is
+  present a job is known to be background immediately, without waiting for the turn to end.
+
+Stopping a job re-resolves the PID and checks its start time still matches before signalling,
+so a recycled PID can never be hit by a stale row.
 
 ## Known limitations
 
-- Claude Code only. Other providers do not use the same task-output convention, so their
-  background work will not appear.
-- Linux only. The scanner reads `/proc`, so it does not run on a macOS or Windows daemon.
-- Processes fully detached from the agent (`setsid`, `nohup`, a service the agent started
-  through `systemctl`) redirect their own output and will not be listed.
-- Jobs are only visible while their process is alive; this is a live process view, not a
-  history of everything the agent backgrounded.
-- The plugin reports on the daemon host it runs on, so a job is only visible to the daemon
-  whose machine it is running on.
+- The daemon host must be Linux: attribution reads `/proc`.
+- Codex runs shell commands inside a sandbox in its default modes and reaps the sandbox when
+  the command returns, so a process it backgrounds usually does not survive to be listed.
+  This is Codex's behaviour, not a detection gap; jobs it starts in full-access mode are
+  found normally.
+- The output tail only works when the job's stdout is a regular file — Claude Code's task
+  logs, or anything the agent redirected itself. Providers that pipe output instead show the
+  job without a tail.
+- Work started before the plugin was installed is still found, but its `background` label may
+  rely on its agent no longer running, since no turn boundary was observed for it.
+- Jobs are visible to the daemon on whose machine they run.
 
 ## Development
 

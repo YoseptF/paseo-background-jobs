@@ -16,6 +16,7 @@ import {
   listBackgroundJobsRpc,
   readJobOutputRpc,
   type BackgroundJob,
+  type JobKind,
 } from "../shared/jobs";
 
 type Theme = PluginSurfaceProps["theme"];
@@ -28,14 +29,16 @@ const OUTPUT_LINES = 24;
 
 const JOBS_KEY = ["background-jobs", "list"] as const;
 
-function useJobs(agentId?: string) {
-  const listJobs = useRpc(listBackgroundJobsRpc);
-  return useQuery({
-    queryKey: [...JOBS_KEY, agentId ?? "all"],
-    queryFn: () => listJobs(agentId ? { agentId } : {}),
-    refetchInterval: JOB_POLL_MS,
-    refetchIntervalInBackground: false,
-  });
+const KIND_LABEL: Record<JobKind, string> = {
+  background: "background",
+  detached: "detached",
+  active: "active",
+};
+
+function kindColor(kind: JobKind, theme: Theme): string {
+  if (kind === "detached") return theme.colors.statusDanger;
+  if (kind === "background") return theme.colors.statusWarning;
+  return theme.colors.statusSuccess;
 }
 
 function stateLabel(state: string): string {
@@ -46,25 +49,24 @@ function stateLabel(state: string): string {
   return "sleeping";
 }
 
-function statusColor(job: BackgroundJob, theme: Theme): string {
-  if (job.state.startsWith("Z")) return theme.colors.statusDanger;
-  if (job.orphaned) return theme.colors.statusWarning;
-  return theme.colors.statusSuccess;
-}
-
 function JobOutput({ job, theme }: { job: BackgroundJob; theme: Theme }) {
   const readOutput = useRpc(readJobOutputRpc);
   const query = useQuery({
-    queryKey: ["background-jobs", "output", job.pid, job.shellId],
-    queryFn: () => readOutput({ pid: job.pid, shellId: job.shellId }),
+    queryKey: ["background-jobs", "output", job.pid, job.startedAt],
+    queryFn: () => readOutput({ pid: job.pid, startedAt: job.startedAt }),
     refetchInterval: JOB_POLL_MS,
     refetchIntervalInBackground: false,
   });
 
   const body = useMemo(() => {
     if (query.isPending) return "Reading output…";
-    if (query.isError) return query.error instanceof Error ? query.error.message : "Output unavailable.";
-    const text = query.data?.text.trimEnd() ?? "";
+    if (query.isError) {
+      return query.error instanceof Error ? query.error.message : "Output unavailable.";
+    }
+    if (!query.data?.available) {
+      return "This provider pipes the job's output instead of writing it to a file, so there is nothing to tail.";
+    }
+    const text = query.data.text.trimEnd();
     if (text.length === 0) return "No output yet.";
     return text.split("\n").slice(-OUTPUT_LINES).join("\n");
   }, [query.data, query.error, query.isError, query.isPending]);
@@ -111,7 +113,7 @@ function JobCard({
 
   const kill = useMutation({
     mutationFn: (signal: "SIGTERM" | "SIGKILL") =>
-      killJob({ pid: job.pid, shellId: job.shellId, signal }),
+      killJob({ pid: job.pid, startedAt: job.startedAt, signal }),
     onSuccess: (result) => {
       toast.show(result.message, { variant: result.killed ? "success" : "error" });
       void queryClient.invalidateQueries({ queryKey: JOBS_KEY });
@@ -127,11 +129,13 @@ function JobCard({
     `PID ${job.pid}`,
     stateLabel(job.state),
     job.descendants > 0 ? `${job.descendants} child${job.descendants === 1 ? "" : "ren"}` : null,
-    `${formatBytes(job.outputBytes)} out`,
+    job.outputBytes === null ? null : `${formatBytes(job.outputBytes)} out`,
     `${job.cpuSeconds.toFixed(1)}s cpu`,
   ]
     .filter((part): part is string => part !== null)
     .join("  ·  ");
+
+  const accent = kindColor(job.kind, theme);
 
   return (
     <View
@@ -141,27 +145,20 @@ function JobCard({
         borderRadius: RADIUS.md,
         backgroundColor: theme.colors.surface1,
         borderWidth: 1,
-        borderColor: job.orphaned ? theme.colors.statusWarning : theme.colors.border,
+        borderColor: job.kind === "active" ? theme.colors.border : accent,
       }}
     >
       <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm }}>
-        <View
-          style={{
-            width: 8,
-            height: 8,
-            borderRadius: 4,
-            backgroundColor: statusColor(job, theme),
-          }}
-        />
-        <Text style={{ color: theme.colors.foreground, fontSize: TYPE.title, flexShrink: 1 }}>
+        <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: accent }} />
+        <Text style={{ color: theme.colors.foreground, fontSize: TYPE.title }}>
           {formatElapsed(job.elapsedSeconds)}
         </Text>
         <Text style={{ color: theme.colors.foregroundMuted, fontSize: TYPE.caption, flex: 1 }}>
-          {job.shellId}
+          {[job.provider, job.shellId].filter(Boolean).join(" · ")}
         </Text>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Stop background job ${job.shellId}`}
+          accessibilityLabel={`Stop job ${job.pid}`}
           disabled={kill.isPending}
           onPress={() => kill.mutate("SIGTERM")}
           onLongPress={() => kill.mutate("SIGKILL")}
@@ -188,6 +185,10 @@ function JobCard({
         {job.command || "(command unavailable)"}
       </Text>
 
+      <Text style={{ color: accent, fontSize: TYPE.caption }}>
+        {KIND_LABEL[job.kind]} — {job.reason}
+      </Text>
+
       <Text style={{ color: theme.colors.foregroundMuted, fontSize: TYPE.caption }}>{meta}</Text>
 
       {showAgent ? (
@@ -202,10 +203,6 @@ function JobCard({
             {job.agentStatus ? ` · agent ${job.agentStatus}` : " · no live agent"}
           </Text>
         </Pressable>
-      ) : job.orphaned ? (
-        <Text style={{ color: theme.colors.statusWarning, fontSize: TYPE.caption }}>
-          Still running while the agent is {job.agentStatus ?? "gone"}.
-        </Text>
       ) : null}
 
       <Pressable
@@ -239,9 +236,17 @@ function JobList({
   navigation: Navigation;
   emptyHint: string;
 }) {
-  const query = useJobs(agentId);
+  const [includeActive, setIncludeActive] = useState(false);
+  const listJobs = useRpc(listBackgroundJobsRpc);
+  const query = useQuery({
+    queryKey: [...JOBS_KEY, agentId ?? "all", includeActive],
+    queryFn: () => listJobs({ ...(agentId ? { agentId } : {}), includeActive }),
+    refetchInterval: JOB_POLL_MS,
+    refetchIntervalInBackground: false,
+  });
+
   const jobs = query.data?.jobs ?? [];
-  const orphaned = jobs.filter((job) => job.orphaned).length;
+  const leftBehind = jobs.filter((job) => job.orphaned && job.kind !== "active").length;
 
   return (
     <ScrollView
@@ -252,19 +257,38 @@ function JobList({
       }}
     >
       <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm }}>
-        <Text style={{ color: theme.colors.foreground, fontSize: TYPE.heading }}>
-          {jobs.length === 0 ? "No background jobs" : `${jobs.length} background job${jobs.length === 1 ? "" : "s"}`}
+        <Text style={{ color: theme.colors.foreground, fontSize: TYPE.heading, flex: 1 }}>
+          {jobs.length === 0
+            ? "No jobs running"
+            : `${jobs.length} job${jobs.length === 1 ? "" : "s"} running`}
         </Text>
         {query.isFetching ? <ActivityIndicator color={theme.colors.accent} size="small" /> : null}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={includeActive ? "Hide in-turn jobs" : "Show in-turn jobs"}
+          onPress={() => setIncludeActive((value) => !value)}
+          style={{
+            paddingVertical: SPACE.xs,
+            paddingHorizontal: SPACE.sm,
+            borderRadius: RADIUS.sm,
+            borderWidth: 1,
+            borderColor: theme.colors.border,
+            backgroundColor: includeActive ? theme.colors.surface2 : "transparent",
+          }}
+        >
+          <Text style={{ color: theme.colors.foregroundMuted, fontSize: TYPE.caption }}>
+            in-turn
+          </Text>
+        </Pressable>
       </View>
-      {orphaned > 0 ? (
+      {leftBehind > 0 ? (
         <Text style={{ color: theme.colors.statusWarning, fontSize: TYPE.body }}>
-          {orphaned} outliving {orphaned === 1 ? "its" : "their"} agent.
+          {leftBehind} outliving {leftBehind === 1 ? "its" : "their"} agent.
         </Text>
       ) : null}
       {query.isError ? (
         <Text style={{ color: theme.colors.statusDanger, fontSize: TYPE.body }}>
-          {query.error instanceof Error ? query.error.message : "Could not scan for background jobs."}
+          {query.error instanceof Error ? query.error.message : "Could not scan for jobs."}
         </Text>
       ) : null}
       {jobs.length === 0 && !query.isPending ? (
@@ -272,7 +296,7 @@ function JobList({
       ) : null}
       {jobs.map((job) => (
         <JobCard
-          key={`${job.pid}:${job.shellId}`}
+          key={`${job.pid}:${job.startedAt}`}
           job={job}
           theme={theme}
           showAgent={agentId === undefined}
@@ -289,7 +313,7 @@ export function BackgroundJobsSurface({ theme, layout, navigation }: PluginSurfa
       theme={theme}
       layout={layout}
       navigation={navigation}
-      emptyHint="Nothing your agents started in the background is still alive on this machine."
+      emptyHint="Nothing your agents started is still running on this machine."
     />
   );
 }
@@ -301,15 +325,18 @@ export function BackgroundJobsPanel({ theme, layout, navigation, agentId }: Plug
       theme={theme}
       layout={layout}
       navigation={navigation}
-      emptyHint="This agent has no background job still running."
+      emptyHint="This agent has nothing still running."
     />
   );
 }
 
-/** One composer pill per agent, showing that agent's live background job count. */
+/** One composer pill per agent, counting what that agent left running. */
 export function contributeBackgroundJobsClient(client: PluginClientContext) {
   const agents = new Map<string, string>();
-  const pills = new Map<string, { remove(): void; update(patch: { label?: string; visible?: boolean }): void }>();
+  const pills = new Map<
+    string,
+    { remove(): void; update(patch: { label?: string; visible?: boolean }): void }
+  >();
   let counts = new Map<string, number>();
   let stopped = false;
   let refreshing = false;
@@ -321,7 +348,7 @@ export function contributeBackgroundJobsClient(client: PluginClientContext) {
 
   const syncPill = (agentId: string, workspaceId: string) => {
     const count = counts.get(agentId) ?? 0;
-    const label = count === 1 ? "1 background job" : `${count} background jobs`;
+    const label = count === 1 ? "1 job running" : `${count} jobs running`;
     const existing = pills.get(agentId);
     if (existing) {
       existing.update({ label, visible: count > 0 });
@@ -351,7 +378,9 @@ export function contributeBackgroundJobsClient(client: PluginClientContext) {
     if (stopped || refreshing) return;
     refreshing = true;
     try {
-      const { jobs } = await client.rpc(listBackgroundJobsRpc, {});
+      // The pill counts only what the agent is not waiting on, so it does not flicker
+      // once per command while a turn runs.
+      const { jobs } = await client.rpc(listBackgroundJobsRpc, { includeActive: false });
       if (stopped) return;
       const next = new Map<string, number>();
       for (const job of jobs) {

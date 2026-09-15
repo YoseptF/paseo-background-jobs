@@ -1,9 +1,9 @@
 {
   "name": "paseo-background-jobs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "See the shells your Claude Code agents left running in Paseo, and stop them.",
+  "description": "See what your Paseo agents left running, whatever provider they use, and stop it.",
   "keywords": [
     "paseo",
     "paseo-plugin",

@@ -1,184 +1,99 @@
-import { open, readFile, readdir, readlink, stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { open } from "node:fs/promises";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   MAX_OUTPUT_BYTES,
   type BackgroundJob,
+  type JobKind,
   type killBackgroundJobRpc,
   type listBackgroundJobsRpc,
   type readJobOutputRpc,
 } from "../shared/jobs";
+import {
+  countDescendants,
+  readProcessTable,
+  statFile,
+  tailFile,
+  type ProcessEntry,
+} from "./processes";
 
-/**
- * Claude Code points a Bash tool's stdout at
- * `<tmp>/claude-<uid>/<project>/<sessionId>/tasks/<shellId>.output`, so a live process
- * holding that path on fd 1 is an agent-spawned shell, and the path carries both the
- * session and the provider's own shell id.
- */
-export const OUTPUT_PATH =
-  /\/(?<session>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/tasks\/(?<shell>[^/]+)\.output$/;
-
-/**
- * procfs cannot tell a backgrounded shell from one the agent is still blocked on:
- * both get their own process group and session, /dev/null on stdin, and the same
- * output file. The transcript is the only authoritative record, and it announces
- * every backgrounded shell by id.
- */
-export const BACKGROUND_ANNOUNCEMENT = /running in background with ID: ([A-Za-z0-9_-]+)/g;
-
-/** The command the agent wrote, wrapped in the provider's shell-snapshot preamble. */
-const EVAL_COMMAND = /&&\s*eval\s+'([\s\S]*?)'\s*<\s*\/dev\/null/;
-
-const CLOCK_TICKS_PER_SECOND = 100;
-/** An agent in one of these states is not going to collect this job's output. */
+/** An agent in one of these states cannot be waiting on anything it started. */
 const INACTIVE_AGENT_STATUSES = new Set(["idle", "closed", "error", "initializing"]);
 
-interface ProcStat {
-  pid: number;
-  ppid: number;
-  pgid: number;
-  state: string;
-  cpuSeconds: number;
+/**
+ * Providers start their MCP servers and other session plumbing immediately after launch.
+ * Those are part of the agent's runtime rather than work it kicked off, so anything that
+ * appears in the provider's first moments is treated as setup, not as a job.
+ */
+const SETUP_GRACE_MS = 15_000;
+
+/**
+ * Claude Code names each Bash shell and points its stdout at
+ * `<tmp>/claude-<uid>/<project>/<sessionId>/tasks/<shellId>.output`. Other providers do
+ * not, so this is read as a bonus — the shell id and a tailable log — never as the way
+ * jobs are found.
+ */
+const CLAUDE_TASK_OUTPUT =
+  /\/(?<session>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/tasks\/(?<shell>[^/]+)\.output$/;
+
+/** Claude Code announces every shell it backgrounds, by id, in the session transcript. */
+export const BACKGROUND_ANNOUNCEMENT = /running in background with ID: ([A-Za-z0-9_-]+)/g;
+
+export interface AgentInfo {
+  id: string;
+  title: string | null;
+  status: string | null;
+  workspaceId: string | null;
+  provider: string | null;
+  sessionId: string | null;
 }
 
-export interface ShellProcess extends ProcStat {
-  shellId: string;
-  sessionId: string;
-  outputPath: string;
-  command: string;
-  cwd: string;
-  startedAt: Date;
-}
-
-interface ProcessEntry {
-  stat: ProcStat;
-  /** Where stdout points, when it is readable. */
-  stdout: string | null;
+/** Agents the daemon knows about, keyed by agent id. */
+export async function listAgents(
+  paseo: PluginHandlerContext["paseo"],
+): Promise<Map<string, AgentInfo>> {
+  const agents = new Map<string, AgentInfo>();
+  let entries: readonly unknown[];
+  try {
+    ({ entries } = await paseo.agents.list());
+  } catch {
+    return agents;
+  }
+  for (const entry of entries) {
+    const agent = (entry as { agent?: Record<string, unknown> }).agent;
+    const id = agent && typeof agent["id"] === "string" ? agent["id"] : null;
+    if (!agent || !id) continue;
+    const runtimeInfo = agent["runtimeInfo"] as { sessionId?: unknown } | undefined;
+    agents.set(id, {
+      id,
+      title: typeof agent["title"] === "string" ? agent["title"] : null,
+      status: typeof agent["status"] === "string" ? agent["status"] : null,
+      workspaceId: typeof agent["workspaceId"] === "string" ? agent["workspaceId"] : null,
+      provider: typeof agent["provider"] === "string" ? agent["provider"] : null,
+      sessionId: typeof runtimeInfo?.sessionId === "string" ? runtimeInfo.sessionId : null,
+    });
+  }
+  return agents;
 }
 
 /**
- * One pass over /proc per refresh. The pill polls continuously, so walking the
- * table three times (shells, parents, descendants) was three times the syscalls
- * for the same snapshot.
+ * Processes still alive when a turn finished. Nothing is waiting on them by definition,
+ * so they stay marked as background for the rest of their life — this is what gives
+ * providers with no background announcement of their own an exact signal.
  */
-async function readProcessTable(): Promise<Map<number, ProcessEntry>> {
-  const uid = process.getuid?.();
-  let names: string[];
-  try {
-    names = await readdir("/proc");
-  } catch {
-    return new Map();
-  }
-  const table = new Map<number, ProcessEntry>();
-  await Promise.all(
-    names.map(async (name) => {
-      if (!/^\d+$/.test(name)) return;
-      const pid = Number(name);
-      let raw: string;
-      try {
-        if (uid !== undefined && (await stat(`/proc/${name}`)).uid !== uid) return;
-        raw = await readFile(`/proc/${name}/stat`, "utf8");
-      } catch {
-        return;
-      }
-      const procStat = parseProcStat(pid, raw);
-      if (!procStat) return;
-      const stdout = await readlink(`/proc/${name}/fd/1`).catch(() => null);
-      table.set(pid, { stat: procStat, stdout });
-    }),
-  );
-  return table;
+const survivedATurn = new Map<string, Set<number>>();
+
+export function recordTurnSurvivors(agentId: string, pids: readonly number[]): void {
+  const known = survivedATurn.get(agentId) ?? new Set<number>();
+  for (const pid of pids) known.add(pid);
+  survivedATurn.set(agentId, known);
 }
 
-/** `pid (comm) state ppid pgrp ...` — comm can contain spaces and parentheses, so split on the last `)`. */
-export function parseProcStat(pid: number, raw: string): ProcStat | null {
-  const close = raw.lastIndexOf(")");
-  if (close < 0) return null;
-  const fields = raw.slice(close + 2).trim().split(/\s+/);
-  const state = fields[0];
-  const ppid = Number(fields[1]);
-  const pgid = Number(fields[2]);
-  const utime = Number(fields[11]);
-  const stime = Number(fields[12]);
-  if (!state || Number.isNaN(ppid) || Number.isNaN(pgid)) return null;
-  return { pid, ppid, pgid, state, cpuSeconds: (utime + stime) / CLOCK_TICKS_PER_SECOND };
-}
-
-/** Strip the provider's shell-snapshot preamble back down to the command the agent wrote. */
-export function unwrapCommand(cmdline: string): string {
-  const argv = cmdline.split("\0").filter((part) => part.length > 0);
-  const joined = argv.join(" ");
-  const command = EVAL_COMMAND.exec(joined)?.[1] ?? joined;
-  // zsh -c 'eval ...' escapes an embedded single quote as '"'"'.
-  return command.replaceAll(`'"'"'`, "'").trim();
-}
-
-async function readCommand(pid: number): Promise<string> {
-  try {
-    return unwrapCommand(await readFile(`/proc/${pid}/cmdline`, "utf8"));
-  } catch {
-    return "";
-  }
-}
-
-/** Every live process whose stdout is an agent shell's output file, children included. */
-export async function scanShellProcesses(
-  table?: Map<number, ProcessEntry>,
-): Promise<ShellProcess[]> {
-  const processes = table ?? (await readProcessTable());
-  const shells: ShellProcess[] = [];
-  await Promise.all(
-    [...processes].map(async ([pid, entry]) => {
-      if (!entry.stdout) return;
-      const match = OUTPUT_PATH.exec(entry.stdout);
-      const sessionId = match?.groups?.["session"];
-      const shellId = match?.groups?.["shell"];
-      if (!sessionId || !shellId) return;
-      const [command, cwd, startedAt] = await Promise.all([
-        readCommand(pid),
-        readlink(`/proc/${pid}/cwd`).catch(() => ""),
-        stat(`/proc/${pid}`)
-          .then((info) => info.ctime)
-          .catch(() => new Date()),
-      ]);
-      shells.push({
-        ...entry.stat,
-        shellId,
-        sessionId,
-        outputPath: entry.stdout,
-        command,
-        cwd,
-        startedAt,
-      });
-    }),
-  );
-  return shells;
-}
-
-/** Transitive child count per root, so a job reads as more than the one shell being signalled. */
-function countDescendants(
-  table: Map<number, ProcessEntry>,
-  roots: readonly number[],
-): Map<number, number> {
-  const children = new Map<number, number[]>();
-  for (const { stat: procStat } of table.values()) {
-    const siblings = children.get(procStat.ppid);
-    if (siblings) siblings.push(procStat.pid);
-    else children.set(procStat.ppid, [procStat.pid]);
-  }
-  const counts = new Map<number, number>();
-  for (const root of roots) {
-    let total = 0;
-    const queue = [...(children.get(root) ?? [])];
-    for (let next = queue.pop(); next !== undefined; next = queue.pop()) {
-      total += 1;
-      queue.push(...(children.get(next) ?? []));
-    }
-    counts.set(root, total);
-  }
-  return counts;
+export function forgetAgent(agentId: string): void {
+  survivedATurn.delete(agentId);
 }
 
 interface TranscriptScan {
@@ -194,28 +109,22 @@ function claudeProjectsDir(): string {
   return join(configDir && configDir.length > 0 ? configDir : join(homedir(), ".claude"), "projects");
 }
 
-/** Transcripts are filed under a per-cwd directory, so find the session by name. */
+/** Transcripts are filed under a per-cwd directory, so find the session by file name. */
 async function findTranscript(sessionId: string): Promise<string | null> {
-  const root = claudeProjectsDir();
   let projects: string[];
   try {
-    projects = await readdir(root);
+    projects = await readdir(claudeProjectsDir());
   } catch {
     return null;
   }
   for (const project of projects) {
-    const candidate = join(root, project, `${sessionId}.jsonl`);
-    try {
-      await stat(candidate);
-      return candidate;
-    } catch {
-      continue;
-    }
+    const candidate = join(claudeProjectsDir(), project, `${sessionId}.jsonl`);
+    if (await statFile(candidate)) return candidate;
   }
   return null;
 }
 
-/** Shell ids the agent explicitly backgrounded in this session. */
+/** Shell ids Claude Code explicitly backgrounded in this session. */
 async function backgroundShellIds(sessionId: string): Promise<Set<string>> {
   const cached = transcriptScans.get(sessionId) ?? { offset: 0, shellIds: new Set<string>() };
   const path = await findTranscript(sessionId);
@@ -232,8 +141,7 @@ async function backgroundShellIds(sessionId: string): Promise<Set<string>> {
     try {
       const buffer = Buffer.alloc(info.size - cached.offset);
       await handle.read(buffer, 0, buffer.length, cached.offset);
-      const text = buffer.toString("utf8");
-      for (const match of text.matchAll(BACKGROUND_ANNOUNCEMENT)) {
+      for (const match of buffer.toString("utf8").matchAll(BACKGROUND_ANNOUNCEMENT)) {
         const shellId = match[1];
         if (shellId) cached.shellIds.add(shellId);
       }
@@ -246,149 +154,189 @@ async function backgroundShellIds(sessionId: string): Promise<Set<string>> {
   return cached.shellIds;
 }
 
-interface AgentInfo {
-  id: string;
-  title: string | null;
-  status: string | null;
-  workspaceId: string | null;
-}
-
-/** sessionId -> agent, from the runtime info the daemon already tracks. */
-async function mapSessionsToAgents(
-  paseo: PluginHandlerContext["paseo"],
-): Promise<Map<string, AgentInfo>> {
-  const bySession = new Map<string, AgentInfo>();
-  let entries: readonly unknown[];
-  try {
-    ({ entries } = await paseo.agents.list());
-  } catch {
-    return bySession;
-  }
-  for (const entry of entries) {
-    const agent = (entry as { agent?: Record<string, unknown> }).agent;
-    if (!agent) continue;
-    const runtimeInfo = agent["runtimeInfo"] as { sessionId?: unknown } | undefined;
-    const sessionId = typeof runtimeInfo?.sessionId === "string" ? runtimeInfo.sessionId : null;
-    if (!sessionId) continue;
-    bySession.set(sessionId, {
-      id: String(agent["id"] ?? ""),
-      title: typeof agent["title"] === "string" ? agent["title"] : null,
-      status: typeof agent["status"] === "string" ? agent["status"] : null,
-      workspaceId: typeof agent["workspaceId"] === "string" ? agent["workspaceId"] : null,
-    });
-  }
-  return bySession;
+export interface JobRoot {
+  entry: ProcessEntry;
+  agentId: string;
+  /** The provider process this agent runs in, when it is still alive. */
+  provider: ProcessEntry | null;
+  detached: boolean;
 }
 
 /**
- * One entry per backgrounded shell. Children inherit the output file on fd 1, so
- * collapse each shell id onto its process-group leader.
+ * The topmost agent-owned process of each piece of work.
+ *
+ * Every process an agent touches carries its `PASEO_AGENT_ID`, so a job is a process
+ * whose parent is *not* also owned by the same agent — either a direct child of the
+ * provider, or one that has been reparented away from it. Anything deeper is part of
+ * that job rather than a job of its own.
  */
-export async function collectJobShells(
-  table?: Map<number, ProcessEntry>,
-): Promise<ShellProcess[]> {
-  const byShell = new Map<string, ShellProcess>();
-  for (const shell of await scanShellProcesses(table)) {
-    const key = `${shell.sessionId}:${shell.shellId}`;
-    const current = byShell.get(key);
-    const isLeader = shell.pid === shell.pgid;
-    if (!current || (isLeader && current.pid !== current.pgid) || shell.pid < current.pid) {
-      if (current && current.pid === current.pgid && !isLeader) continue;
-      byShell.set(key, shell);
-    }
+export function findJobRoots(table: Map<number, ProcessEntry>, daemonPid: number): JobRoot[] {
+  const providers = new Map<string, ProcessEntry>();
+  for (const entry of table.values()) {
+    if (entry.agentId && entry.stat.ppid === daemonPid) providers.set(entry.agentId, entry);
   }
-  const leaders = [...byShell.values()];
-  const backgrounded = await Promise.all(
-    leaders.map(async (shell) => (await backgroundShellIds(shell.sessionId)).has(shell.shellId)),
-  );
-  return leaders.filter((_, index) => backgrounded[index]);
+
+  const roots: JobRoot[] = [];
+  for (const entry of table.values()) {
+    const agentId = entry.agentId;
+    if (!agentId) continue;
+    const provider = providers.get(agentId) ?? null;
+    if (provider && entry.stat.pid === provider.stat.pid) continue;
+    // The provider is agent-owned too, so its direct children start jobs rather than
+    // continue one; anything deeper under another agent-owned process is part of that job.
+    const parentIsProvider = provider !== null && entry.stat.ppid === provider.stat.pid;
+    const parent = table.get(entry.stat.ppid);
+    if (!parentIsProvider && parent?.agentId === agentId) continue;
+
+    const detached = !parentIsProvider;
+    // Session plumbing (MCP servers and friends) starts with the provider, not as work.
+    const startedWithProvider =
+      provider !== null &&
+      entry.startedAt.getTime() - provider.startedAt.getTime() < SETUP_GRACE_MS;
+    if (startedWithProvider && !detached) continue;
+
+    roots.push({ entry, agentId, provider, detached });
+  }
+  return roots;
 }
 
-export async function listBackgroundJobs(
-  { agentId }: RpcInput<typeof listBackgroundJobsRpc>,
-  { paseo }: PluginHandlerContext,
-) {
-  const table = await readProcessTable();
-  const [shells, agentsBySession] = await Promise.all([
-    collectJobShells(table),
-    mapSessionsToAgents(paseo),
-  ]);
-  const descendants = countDescendants(table, shells.map((shell) => shell.pid));
+function classify(
+  root: JobRoot,
+  agent: AgentInfo | undefined,
+  explicitlyBackgrounded: boolean,
+): { kind: JobKind; reason: string } {
+  if (explicitlyBackgrounded) {
+    return { kind: "background", reason: "the provider backgrounded it" };
+  }
+  if (root.detached) {
+    return { kind: "detached", reason: "it left the agent's process tree" };
+  }
+  if (survivedATurn.get(root.agentId)?.has(root.entry.stat.pid)) {
+    return { kind: "background", reason: "it outlived the turn that started it" };
+  }
+  if (!agent) {
+    return { kind: "background", reason: "its agent is gone" };
+  }
+  if (INACTIVE_AGENT_STATUSES.has(agent.status ?? "")) {
+    return { kind: "background", reason: `its agent is ${agent.status}` };
+  }
+  return { kind: "active", reason: "its agent is mid-turn and may be waiting on it" };
+}
+
+/** Claude Code's task-output path, when this job happens to have one. */
+function claudeTaskOutput(entry: ProcessEntry): { sessionId: string; shellId: string } | null {
+  if (!entry.stdout) return null;
+  const groups = CLAUDE_TASK_OUTPUT.exec(entry.stdout)?.groups;
+  const sessionId = groups?.["session"];
+  const shellId = groups?.["shell"];
+  return sessionId && shellId ? { sessionId, shellId } : null;
+}
+
+export interface ScanOptions {
+  daemonPid: number;
+  paseo: PluginHandlerContext["paseo"];
+}
+
+export async function scanJobs({ daemonPid, paseo }: ScanOptions): Promise<BackgroundJob[]> {
+  const [table, agents] = await Promise.all([readProcessTable(), listAgents(paseo)]);
+  const roots = findJobRoots(table, daemonPid);
+  const descendants = countDescendants(
+    table,
+    roots.map((root) => root.entry.stat.pid),
+  );
   const now = Date.now();
 
-  const jobs: BackgroundJob[] = [];
-  for (const shell of shells) {
-    const agent = agentsBySession.get(shell.sessionId) ?? null;
-    if (agentId && agent?.id !== agentId) continue;
-    const output = await stat(shell.outputPath).catch(() => null);
-    jobs.push({
-      pid: shell.pid,
-      pgid: shell.pgid,
-      shellId: shell.shellId,
-      sessionId: shell.sessionId,
-      agentId: agent?.id ?? null,
-      agentTitle: agent?.title ?? null,
-      agentStatus: agent?.status ?? null,
-      workspaceId: agent?.workspaceId ?? null,
-      command: shell.command,
-      cwd: shell.cwd,
-      startedAt: shell.startedAt.toISOString(),
-      elapsedSeconds: Math.max(0, (now - shell.startedAt.getTime()) / 1_000),
-      cpuSeconds: shell.cpuSeconds,
-      state: shell.state,
-      descendants: descendants.get(shell.pid) ?? 0,
-      outputBytes: output?.size ?? 0,
-      outputUpdatedAt: output?.mtime.toISOString() ?? null,
-      orphaned: agent === null || INACTIVE_AGENT_STATUSES.has(agent.status ?? ""),
-    });
-  }
-  jobs.sort((left, right) => right.elapsedSeconds - left.elapsedSeconds);
-  return { jobs, scannedAt: new Date().toISOString() };
+  return Promise.all(
+    roots.map(async (root): Promise<BackgroundJob> => {
+      const agent = agents.get(root.agentId);
+      const task = claudeTaskOutput(root.entry);
+      const explicit =
+        task !== null && (await backgroundShellIds(task.sessionId)).has(task.shellId);
+      const { kind, reason } = classify(root, agent, explicit);
+      const output = root.entry.stdout ? await statFile(root.entry.stdout) : null;
+      return {
+        pid: root.entry.stat.pid,
+        pgid: root.entry.stat.pgid,
+        startedAt: root.entry.startedAt.toISOString(),
+        kind,
+        reason,
+        agentId: root.agentId,
+        agentTitle: agent?.title ?? null,
+        agentStatus: agent?.status ?? null,
+        workspaceId: agent?.workspaceId ?? null,
+        provider: agent?.provider ?? null,
+        shellId: task?.shellId ?? null,
+        command: root.entry.command,
+        cwd: root.entry.cwd,
+        elapsedSeconds: Math.max(0, (now - root.entry.startedAt.getTime()) / 1_000),
+        cpuSeconds: root.entry.stat.cpuSeconds,
+        state: root.entry.stat.state,
+        descendants: descendants.get(root.entry.stat.pid) ?? 0,
+        outputBytes: output?.size ?? null,
+        outputUpdatedAt: output?.mtime.toISOString() ?? null,
+        orphaned: !agent || INACTIVE_AGENT_STATUSES.has(agent.status ?? ""),
+      };
+    }),
+  );
 }
 
-/** Resolve a pid back to a live job so output and kill can never touch an unrelated process. */
-async function requireJob(pid: number, shellId: string): Promise<ShellProcess> {
-  const shell = (await collectJobShells()).find((candidate) => candidate.pid === pid);
-  if (!shell) throw new Error(`No background job is running as PID ${pid}.`);
-  if (shell.shellId !== shellId) {
-    throw new Error(`PID ${pid} now belongs to shell ${shell.shellId}, not ${shellId}.`);
-  }
-  return shell;
-}
-
-export async function readJobOutput({ pid, shellId }: RpcInput<typeof readJobOutputRpc>) {
-  const shell = await requireJob(pid, shellId);
-  const info = await stat(shell.outputPath).catch(() => null);
-  if (!info) return { text: "", bytes: 0, truncated: false };
-  const start = Math.max(0, info.size - MAX_OUTPUT_BYTES);
-  const handle = await open(shell.outputPath, "r");
-  try {
-    const buffer = Buffer.alloc(info.size - start);
-    await handle.read(buffer, 0, buffer.length, start);
-    return { text: buffer.toString("utf8"), bytes: info.size, truncated: start > 0 };
-  } finally {
-    await handle.close();
-  }
-}
-
-export async function killBackgroundJob({
-  pid,
-  shellId,
-  signal = "SIGTERM",
-}: RpcInput<typeof killBackgroundJobRpc>) {
-  const shell = await requireJob(pid, shellId);
-  // Each background shell leads its own process group, so signalling the group takes
-  // the job's children with it. Fall back to the lone pid if it ever shares a group.
-  const ownsGroup = shell.pgid === shell.pid;
-  try {
-    process.kill(ownsGroup ? -shell.pgid : shell.pid, signal);
-  } catch (error) {
-    return { killed: false, message: error instanceof Error ? error.message : String(error) };
-  }
-  return {
-    killed: true,
-    message: ownsGroup
-      ? `Sent ${signal} to process group ${shell.pgid}.`
-      : `Sent ${signal} to PID ${shell.pid}.`,
+export function createHandlers(daemonPid: number) {
+  /** Resolve a reference to a live job so output and stop can never touch another process. */
+  const requireJob = async (
+    pid: number,
+    startedAt: string,
+    paseo: PluginHandlerContext["paseo"],
+  ) => {
+    const job = (await scanJobs({ daemonPid, paseo })).find((candidate) => candidate.pid === pid);
+    if (!job) throw new Error(`No agent job is running as PID ${pid}.`);
+    if (job.startedAt !== startedAt) {
+      throw new Error(`PID ${pid} has been reused since it was listed.`);
+    }
+    return job;
   };
+
+  const listBackgroundJobs = async (
+    { agentId, includeActive = true }: RpcInput<typeof listBackgroundJobsRpc>,
+    { paseo }: PluginHandlerContext,
+  ) => {
+    const jobs = (await scanJobs({ daemonPid, paseo }))
+      .filter((job) => (agentId ? job.agentId === agentId : true))
+      .filter((job) => (includeActive ? true : job.kind !== "active"))
+      .sort((left, right) => right.elapsedSeconds - left.elapsedSeconds);
+    return { jobs, scannedAt: new Date().toISOString() };
+  };
+
+  const readJobOutput = async (
+    { pid, startedAt }: RpcInput<typeof readJobOutputRpc>,
+    { paseo }: PluginHandlerContext,
+  ) => {
+    const job = await requireJob(pid, startedAt, paseo);
+    const stdout = (await readProcessTable()).get(job.pid)?.stdout;
+    const tail = stdout ? await tailFile(stdout, MAX_OUTPUT_BYTES) : null;
+    if (!tail) return { text: "", bytes: 0, truncated: false, available: false };
+    return { ...tail, available: true };
+  };
+
+  const killBackgroundJob = async (
+    { pid, startedAt, signal = "SIGTERM" }: RpcInput<typeof killBackgroundJobRpc>,
+    { paseo }: PluginHandlerContext,
+  ) => {
+    const job = await requireJob(pid, startedAt, paseo);
+    // A job normally leads its own process group, so signalling the group takes its
+    // children with it. Fall back to the lone pid when it shares a group with others.
+    const ownsGroup = job.pgid === job.pid;
+    try {
+      process.kill(ownsGroup ? -job.pgid : job.pid, signal);
+    } catch (error) {
+      return { killed: false, message: error instanceof Error ? error.message : String(error) };
+    }
+    return {
+      killed: true,
+      message: ownsGroup
+        ? `Sent ${signal} to process group ${job.pgid}.`
+        : `Sent ${signal} to PID ${job.pid}.`,
+    };
+  };
+
+  return { listBackgroundJobs, readJobOutput, killBackgroundJob };
 }
